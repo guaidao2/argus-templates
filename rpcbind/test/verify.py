@@ -17,10 +17,14 @@ than one that does not fire at all:
                        a program that is the LAST entry of the registry list is
                        still reported (the entry marker may be 0)
     http : TCP 111     a port that is not RPC produces no RPC finding
-    modern : UDP 111   documents the current gap: argus's UDP scan payload for
-                       111 is a single 0x00 byte, the portmapper drops it, so the
-                       port never reaches the detector (see README)
-    modern : TCP 32771 the opt-in any-port document identifies rpcbind off 111
+    modern : UDP 111   the port is open (the scan payload is a real portmap
+                       call), so the UDP side is identified and the
+                       reflection/amplification finding fires
+    modern : TCP 32771 the opt-in any-port document identifies rpcbind off 111,
+                       and the template's checks follow the service there
+
+The template declares argus_min_version 1.0.1: the UDP scenarios and the service
+binding need it.
 
 Usage:
     python test/verify.py --argus /path/to/argus
@@ -248,29 +252,25 @@ def scenarios(port: int) -> list[dict]:
             },
         },
         {
-            "name": "modern : udp/%d : known gap" % port,
+            "name": "modern : udp/%d : template" % port,
             "profile": "modern",
             "port": port,
             "proto": "udp",
             "plugin": PLUGIN_MAIN,
             "args": ["-Pn", "-sV", "--findings", "-sU"],
             "expect": {
-                # Not a template bug: argus classifies a silent UDP probe as
-                # open|filtered and only runs the detector on open ports, and
-                # its scan payload for 111 is a 1 byte 0x00 that a portmapper
-                # drops. The UDP check therefore cannot run yet.
-                "state": "open|filtered",
-                "service": None,
-                "findings_present": [],
-                "findings_absent": UDP_FINDINGS + TCP_FINDINGS,
+                # The scan payload for 111 is a real portmap call, so the
+                # portmapper answers, the port is open rather than
+                # open|filtered, and the UDP rules get to run at all. Needs
+                # argus 1.0.1, which the version line at startup reports.
+                "state": "open",
+                "service": "rpcbind",
+                "method": "probed",
+                "extrainfo_contains": "RPCB v3",
+                "findings_present": UDP_FINDINGS,
+                "findings_absent": TCP_FINDINGS,
             },
-            "log_must_contain": ["datagram dropped"],
-            "gap": (
-                "argus sends 0x00 as the UDP scan payload for 111; rpcbind drops "
-                "datagrams it cannot decode, so udp/111 stays open|filtered and "
-                "never reaches the detector. One entry in udpHexPayloads fixes "
-                "this -- see README.md, 'Upstream notes'."
-            ),
+            "log_must_contain": ["udp call"],
         },
         {
             "name": "modern : tcp/%d : built-in rules only (baseline)" % port,
@@ -301,20 +301,13 @@ def scenarios(port: int) -> list[dict]:
                 "service": "rpcbind",
                 "method": "probed",
                 "extrainfo_contains": "RPCB v3",
-                "findings_present": [],
-                # The template's checks bind to port 111 and cannot follow the
-                # service name today; the built-in checks can, which is the gap
-                # demonstrated below.
-                "findings_absent": TCP_FINDINGS + UDP_FINDINGS,
+                # The point of the service binding: the template's checks arrive
+                # on a port the template never mentioned, because rpcbind was
+                # identified there.
+                "findings_present": TCP_FINDINGS,
+                "findings_absent": UDP_FINDINGS,
             },
             "rules_present": ["rpc-registered-services"],
-            "gap": (
-                "the template's checks bind to port 111 and do not follow a "
-                "service identified on another port, because AddYAMLFront does "
-                "not index plugin rules by service. The built-in checks do fire "
-                "here, which is what makes the difference visible. See README.md, "
-                "'Upstream notes'."
-            ),
         },
     ]
 
@@ -374,6 +367,33 @@ def port_in_use(port: int) -> bool:
         return True
     finally:
         s.close()
+
+
+def argus_version(argus: str) -> str:
+    """The version the binary reports, e.g. "1.0.1" out of
+    "argus 1.0.1 205119f56b76 go1.26.4 linux/amd64"."""
+    try:
+        out = subprocess.run([argus, "--version"], capture_output=True, text=True,
+                             timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].lower() == "argus":
+            return parts[1]
+    return ""
+
+
+def version_tuple(v: str) -> tuple:
+    out = []
+    for part in v.split("-")[0].split("."):
+        digits = ""
+        for ch in part:
+            if not ch.isdigit():
+                break
+            digits += ch
+        out.append(int(digits or 0))
+    return tuple(out)
 
 
 def run_scenario(argus: str, sc: dict, workdir: str) -> tuple[bool, list[str], str]:
@@ -487,7 +507,16 @@ def main() -> int:
         print("no argus binary found; pass --argus, e.g.")
         print("    cd argus && go build -o /tmp/argus ./cmd/argus")
         return 2
+    version = argus_version(argus)
     print("argus:  %s" % argus)
+    if version:
+        print("version: %s" % version)
+    # The template declares argus_min_version 1.0.1. Saying so here means a run
+    # against an older build explains itself instead of failing on the two
+    # scenarios that need it.
+    if version and version_tuple(version) < (1, 0, 1):
+        print("         note: this template declares argus_min_version 1.0.1, so the")
+        print("               udp/111 and any-port scenarios need a build that new")
     print("plugin: %s" % PLUGIN_DIR)
     print("mock:   %s" % MOCK)
     if port_in_use(args.port):

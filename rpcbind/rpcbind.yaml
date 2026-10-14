@@ -47,7 +47,7 @@ name: rpcbind-111
 version: 1.0.0
 author: guaidao2
 license: MIT
-argus_min_version: 0.1.0
+argus_min_version: 1.0.1
 description: |
   Renders what port 111 discloses: identifies the portmapper from its RPCB v3
   answer, and reports every registered RPC program, including the legacy

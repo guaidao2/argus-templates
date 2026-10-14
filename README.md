@@ -30,6 +30,9 @@ Registering a directory walks it recursively and loads every `*.yaml` in it, so
 read a template's README before registering the directory: a template may ship a
 second, opt-in document next to the default one.
 
+A template declares the argus it needs in `argus_min_version`, so an older build
+refuses to load it rather than doing half the job in silence.
+
 ## Verifying a template
 
 Templates that make claims about wire bytes are expected to prove them. Each one

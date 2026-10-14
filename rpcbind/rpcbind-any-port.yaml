@@ -35,7 +35,7 @@ name: rpcbind-any-port
 version: 1.0.0
 author: guaidao2
 license: MIT
-argus_min_version: 0.1.0
+argus_min_version: 1.0.1
 description: |
   Identifies an ONC RPC portmapper that listens on a port other than 111, so a
   registry behind a container port forward is still recognised and named.

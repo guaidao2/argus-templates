@@ -364,9 +364,10 @@ class Server:
         self.log("listening on udp/%s:%d", self.args.bind_host, self.args.udp_port)
         while True:
             data, addr = s.recvfrom(65535)
-            # A datagram that is not a decodable call is dropped without a
-            # word: that is how rpcbind behaves, and it is why a UDP port scan
-            # sees 111/udp as open|filtered rather than open.
+            # A datagram that is not a decodable call is dropped without a word:
+            # that is how rpcbind behaves. It is what makes a strict mock worth
+            # having -- "the service is filtered" and "the service could not
+            # decode what we sent" look identical from the outside.
             reply = self.handle_call(data, "udp")
             if reply is None:
                 self.log("udp %s: %d byte datagram dropped (no reply)", addr[0], len(data))

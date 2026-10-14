@@ -39,6 +39,9 @@ $ argus -Pn -sV --findings -p 111 10.0.0.9
 
 ## 安装
 
+需要 argus **1.0.1 或更新**；文档里声明了这一点，因此更旧的构建会直接拒绝加载，
+而不是悄悄只做一半的活。
+
 ```bash
 # 只装这一个文档（仅 111 端口）——推荐
 argus --register-plugin ./rpcbind/rpcbind.yaml
@@ -52,7 +55,7 @@ argus --register-plugin ./rpcbind/
 ```bash
 argus -Pn -sV -p 111 10.0.0.9                        # 识别 + banner + 内置检测
 argus -Pn -sV --findings -p 111 10.0.0.9             # 加上本模板的注册表渲染
-argus -Pn -sV --findings -sU -p 111 10.0.0.9         # 加上 UDP 侧（见"上游说明"）
+argus -Pn -sV --findings -sU -p 111 10.0.0.9         # 加上 UDP 侧
 argus -Pn -sV --findings --hack-reason -p 111 10.0.0.9
 ```
 
@@ -124,8 +127,9 @@ finding 必须加 `--findings` 才会出现，与内置检测一致：它们的�
   这一点写在 hack-reason 笔记里，让看报告的人一定能看到。
 * **不用 `GETPORT`/`GETADDR` 做逐程序检测。** 那会和内置的 NFS/NIS 结论重复，并且为注册表
   已经携带的信息再发一次请求。
-* **没有 any-port 检测。** any-port 文档只做识别。没有 `ports:` 的 check 会被 argus 应用到
-  每一个开放端口，等于把 RPC 调用撒遍整轮扫描；见"上游说明"。
+* **没有 any-port 检测。** any-port 文档只做识别，也不需要自己的检测：`rpcbind.yaml`
+  里的规则同时绑定 `service: rpcbind` 与 111 端口，所以它们会跟随该服务到任何被识别出来的
+  端口上，包括这份文档找到的那个。
 * **不做间接调用探测。** 那是另一个工具的职责，而且那意味着要去跟被扫主机的**客户端**说话。
 
 ## 如何验证
@@ -145,63 +149,14 @@ TCP record marking 与 UDP、无法解码的数据报静默丢弃、不支持的
 | `v2only` | 老 portmap 仍被识别（由内置规则），且 RPCB 规则不会冒领 |
 | `rexd-last` | 位于注册表**最后一项**的程序依然会被报告 |
 | `http` | 不是 RPC 的端口不会产出任何 RPC 结论 |
-| `udp/111 : known gap` | 记录当前的上游缺口，并在它被修好时立刻失败提醒 |
+| `udp/111 : template` | 该端口在 UDP 上是 open，因此 UDP 侧同样被识别，放大结论也会触发 |
 | `built-in rules only` | 基线：仅内置规则也能识别并报 NFS 家族，且链路上没有多余字节（字节数 44 = 声明 40 的 4 字节 marker + 40 字节调用） |
-| `any-port document` | 非标准端口上的 rpcbind 会被识别，并显示模板的检测为何还没跟过去 |
+| `any-port document` | 非标准端口上的 rpcbind 会被识别，**并且**模板的检测会跟随该服务到那里 |
 | pattern 自检 | v2 应答、空注册表、`PROG_MISMATCH` 都不该满足 v3/`unauth-dump` 的 pattern |
 
 脚本需要能绑定 111（因为模板的 check 绑在该端口上）。在 Linux 上这意味着 root 或
-`CAP_NET_BIND_SERVICE`；绑定失败时它会明确报错，而不是悄悄跳过。
-
-## 上游说明
-
-本模板自己做不到的两件事，都在这里**验证过**而不是猜的。两者都不是模板的 bug，记下来
-是为了让下一个人不必重新发现。
-
-### 1. 插件的 check 跟不了服务名
-
-插件规则上的 `service: rpcbind` 目前不起作用：`DB.AddYAMLFront` 会把插件规则登记到它绑定的
-端口和通用列表里，但**从不登记进 `byService`**，而那个索引正是让 check 跟随"在意外端口上
-被识别出来的服务"的机制。所以这里的 check 绑定在端口 `111` 上，如果 rpcbind 出现在比如
-32771，只有**内置**检测会跑，本模板的不会。
-
-```bash
-# any-port 场景的实际效果：内置检测在，本模板的不在
-python test/verify.py --argus ./argus --only any-port --verbose
-```
-
-带 `service:` 但**不写** `ports:` 的 check 在今天比"无效"更糟：它会落进通用列表，而通用
-列表会被 argus 应用到**每一个**开放端口。这就是本目录里的 any-port 文档只含 fingerprint
-规则的原因。
-
-修复位置在 `AddYAMLFront`：在它已经构建端口绑定的地方，把规则也登记进 `db.byService`，
-两行的事。
-
-### 2. `udp/111` 根本到不了探测器
-
-argus 给 111 端口的 UDP 扫描载荷是单个 `0x00` 字节，portmapper 会一声不响地丢掉它（无法
-解码）。于是该端口被报成 `open|filtered`，而检测只在 `open` 端口上运行——所以上面那条
-UDP 识别与 UDP 结论在当前构建上**永远不会触发**。
-
-验证方式：在一份用完即弃的 argus 源码副本里，往 `udpHexPayloads` 加上 portmap DUMP 调用，
-再对着同一个 mock 扫描：
-
-```
-udp/111 state=open service=rpcbind product=ONC RPC portmapper extrainfo='RPCB v3, registry readable'
-udp/111 banner='...............tcp.... 0.0.0.0.0.111...... superuser....udp.... 0.0.0.0.0.111...... superuser...'
-  finding: id=udp-amplification severity=medium rule=rpcbind-udp-registry
-```
-
-做到这件事的那条条目，在 `internal/scan/udp.go`：
-
-```go
-// Portmap/rpcbind DUMP: program 100000, version 2, procedure 4, AUTH_NULL
-// credentials and verifier. 40 bytes, and UDP carries no record marker.
-111: "000000010000000000000002000186a0000000020000000400000000000000000000000000000000",
-```
-
-在那之前，请手工用 `rpcinfo -T udp <host>`；`test/` 里的 mock 复现了这个行为，
-`udp/111 : known gap` 场景把它固化了下来。
+`CAP_NET_BIND_SERVICE`；绑定失败时它会明确报错，而不是悄悄跳过。若拿 1.0.1 之前的构建运行，
+它也会直接说明，而不是丢给你一屏失败。
 
 ## 编写要点
 

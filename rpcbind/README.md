@@ -43,6 +43,9 @@ Two honest limits of that table:
 
 ## Install
 
+Requires argus **1.0.1 or newer**; the document declares it, so an older build
+refuses to load it instead of quietly doing half the job.
+
 ```bash
 # just this document (port 111 only) - recommended
 argus --register-plugin ./rpcbind/rpcbind.yaml
@@ -56,7 +59,7 @@ Scanning:
 ```bash
 argus -Pn -sV -p 111 10.0.0.9                        # identify, banner, built-in checks
 argus -Pn -sV --findings -p 111 10.0.0.9             # + this template's registry rendering
-argus -Pn -sV --findings -sU -p 111 10.0.0.9         # + the UDP side (see "Upstream notes")
+argus -Pn -sV --findings -sU -p 111 10.0.0.9         # + the UDP side
 argus -Pn -sV --findings --hack-reason -p 111 10.0.0.9
 ```
 
@@ -145,9 +148,10 @@ Each pattern is shaped so that it can only fire on the fact it claims.
 * **`GETPORT`/`GETADDR` lookups for specific programs are not used as checks.**
   They would duplicate the built-in NFS/NIS findings and add a second request per
   program for the same information the registry already carries.
-* **No any-port checks.** The any-port document identifies the service only. A
-  check with no `ports:` binding is applied to every open port by argus, which
-  would send RPC calls across the whole scan; see the upstream notes.
+* **No any-port checks.** The any-port document identifies the service only. It
+  does not need checks of its own: the rules in `rpcbind.yaml` bind to
+  `service: rpcbind` as well as to port 111, so they follow the service onto
+  whatever port it was identified on, including the one this document found.
 * **No inline-call probing of other RPC services.** That is a different tool's
   job, and it would mean speaking to the scanned host's *clients*.
 
@@ -169,67 +173,15 @@ real argus report against it:
 | `v2only` | an old portmap is still identified (by the built-in rule) and the RPCB rule does not claim it |
 | `rexd-last` | a program that is the **last** entry of the registry is still reported |
 | `http` | a port that is not RPC produces no RPC finding |
-| `udp/111 : known gap` | documents the current upstream gap, and fails loudly when it is fixed |
+| `udp/111 : template` | the port is open over UDP, so it is identified there too and the amplification finding fires |
 | `built-in rules only` | the baseline: the built-in database identifies the port and reports the NFS family, with no stray bytes on the wire (byte counts: 44 = 4 byte marker that declares 40 + 40 bytes of call) |
-| `any-port document` | rpcbind on a non-standard port is identified, and shows why the template's checks do not follow it there yet |
+| `any-port document` | rpcbind on a non-standard port is identified **and** the template's checks follow the service there |
 | pattern self-test | a v2 answer, an empty registry and a `PROG_MISMATCH` reply must not satisfy the v3/`unauth-dump` patterns |
 
 The harness needs to bind 111, because the template's checks bind to that port.
 On Linux that means root or `CAP_NET_BIND_SERVICE`; if it cannot bind, it says so
-instead of skipping quietly.
-
-## Upstream notes
-
-Two things this template cannot do on its own, both verified here rather than
-guessed. Neither is a template bug; both are recorded so the next person does
-not rediscover them.
-
-### 1. A plugin check cannot follow the service name
-
-`service: rpcbind` on a plugin rule currently has no effect: `DB.AddYAMLFront`
-registers a plugin rule under its port and in the generic list, but never in
-`byService`, which is the index that makes a check follow a service found on an
-unexpected port. So the checks here bind to port `111`, and on a portmapper found
-at, say, 32771 only the *built-in* checks fire.
-
-```bash
-# the any-port scenario in action, with the built-in checks visible and ours absent
-python test/verify.py --argus ./argus --only any-port --verbose
-```
-
-A check with `service:` and no `ports:` is worse than inert today: it lands in
-the generic list, which argus applies to **every** open port. That is why the
-any-port document in this directory contains a fingerprint rule only.
-
-The two line fix is in `AddYAMLFront`: register the rule in `db.byService` as
-well, next to the port bindings it already builds.
-
-### 2. `udp/111` never reaches the detector
-
-argus's UDP scan payload for port 111 is a single `0x00` byte, which a portmapper
-drops without a word (it cannot decode it). The port is therefore reported
-`open|filtered`, and detection only runs on `open` ports -- so the UDP
-identification and the UDP finding above cannot fire on this build.
-
-Verified by adding the portmap DUMP call to `udpHexPayloads` in a throwaway copy
-of the argus source and scanning the same mock:
-
-```
-udp/111 state=open service=rpcbind product=ONC RPC portmapper extrainfo='RPCB v3, registry readable'
-udp/111 banner='...............tcp.... 0.0.0.0.0.111...... superuser....udp.... 0.0.0.0.0.111...... superuser...'
-  finding: id=udp-amplification severity=medium rule=rpcbind-udp-registry
-```
-
-The entry that does it, in `internal/scan/udp.go`:
-
-```go
-// Portmap/rpcbind DUMP: program 100000, version 2, procedure 4, AUTH_NULL
-// credentials and verifier. 40 bytes, and UDP carries no record marker.
-111: "000000010000000000000002000186a0000000020000000400000000000000000000000000000000",
-```
-
-Until that exists, use `rpcinfo -T udp <host>` by hand; the mock in `test/`
-reproduces the behaviour, and the `udp/111 : known gap` scenario encodes it.
+instead of skipping quietly. A run against a build older than 1.0.1 says that
+too, rather than reporting a wall of failures.
 
 ## Writing notes
 
