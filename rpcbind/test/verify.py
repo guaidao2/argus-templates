@@ -407,7 +407,11 @@ def run_scenario(argus: str, sc: dict, workdir: str) -> tuple[bool, list[str], s
             stdout=log, stderr=subprocess.STDOUT,
         )
     try:
-        if sc["profile"] != "http" and not wait_for_port(sc["port"], "tcp"):
+        # Wait for the listener even for the http profile: the readiness probe
+        # costs one connection that sends nothing, which is harmless now that
+        # the mock answers each connection in its own thread, and without it
+        # argus can start scanning before the mock is up.
+        if not wait_for_port(sc["port"], "tcp"):
             return False, ["mock never listened on tcp/%d" % sc["port"]], ""
         cmd = [argus, "-p", str(sc["port"]), "-oJ", out_json]
         if sc["plugin"]:

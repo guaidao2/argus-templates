@@ -377,7 +377,13 @@ class Server:
 
 
 class HTTPServer:
-    """A fixed HTTP banner, for the negative control."""
+    """A fixed HTTP banner, for the negative control.
+
+    Threaded like the RPC server: argus opens more than one connection here (a
+    passive read, then a probe), and a mock that answers them one at a time can
+    still be busy with the first when the second arrives -- which looks exactly
+    like a service that does not answer at all.
+    """
 
     BANNER = b"HTTP/1.1 200 OK\r\nServer: mock-http/1.0\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
 
@@ -387,6 +393,18 @@ class HTTPServer:
     def log(self, fmt, *a):
         print(("[%s] " % time.strftime("%H:%M:%S")) + (fmt % a), flush=True)
 
+    def handle(self, conn, addr):
+        try:
+            conn.settimeout(3.0)
+            request = conn.recv(4096)
+            self.log("http %s: %d byte request", addr[0], len(request))
+            if request:
+                conn.sendall(self.BANNER)
+        except OSError as e:
+            self.log("http %s: %s", addr[0], e)
+        finally:
+            conn.close()
+
     def serve(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -395,16 +413,7 @@ class HTTPServer:
         self.log("listening on tcp/%s:%d (profile http)", self.args.bind_host, self.args.tcp_port)
         while True:
             conn, addr = s.accept()
-            try:
-                conn.settimeout(3.0)
-                request = conn.recv(4096)
-                self.log("http %s: %d byte request", addr[0], len(request))
-                if request:
-                    conn.sendall(self.BANNER)
-            except OSError as e:
-                self.log("http %s: %s", addr[0], e)
-            finally:
-                conn.close()
+            threading.Thread(target=self.handle, args=(conn, addr), daemon=True).start()
 
 
 def main():
