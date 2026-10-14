@@ -1,0 +1,69 @@
+# argus template: the portmapper on whatever port it listens on.
+#
+# This is a SECOND, OPT-IN document. It is not needed to scan port 111.
+#
+# Registering the rpcbind/ DIRECTORY registers both documents, because a pack
+# is walked recursively. If you want the port 111 template only, register the
+# file:
+#
+#     argus --register-plugin ./rpcbind/rpcbind.yaml
+#
+# What it is for
+# --------------
+# rpcbind is regularly not on 111: containers, port forwards and appliances
+# move it to a high port where the port table has no idea what lives there.
+# A rule with no `ports:` is tried on every open port, which is the only way a
+# fingerprint database can find a service on a port it did not predict.
+#
+# What it costs
+# -------------
+# It sends one 44 byte ONC RPC DUMP call, on its own connection, to every open
+# port of every scanned host -- and it is tried before the built-in HTTP and
+# TLS rules, because plugin rules are registered ahead of built-in ones. On a
+# host with many open-but-silent ports, that is one connection and up to one
+# read timeout each. Register it when the engagement includes RPC, not by
+# default.
+#
+# What it does and does not deliver
+# ---------------------------------
+# It identifies the service, so the port stops reading as "unknown" and the
+# built-in rpcbind checks (which bind to the service name) run on that port.
+# The checks in rpcbind.yaml bind to port 111 and do not follow the service on
+# this build; see README.md, "Upstream notes", for why and for the fix.
+apiVersion: argus.plugin/v1
+name: rpcbind-any-port
+version: 1.0.0
+author: guaidao2
+license: MIT
+argus_min_version: 0.1.0
+description: |
+  Identifies an ONC RPC portmapper that listens on a port other than 111, so a
+  registry behind a container port forward is still recognised and named.
+
+fingerprints:
+  apiVersion: argus.fingerprint/v1
+  id: rpcbind-any-port-fingerprints
+  description: Find the portmapper wherever it listens
+  rules:
+    - id: rpcbind-any-port
+      description: ONC RPC portmapper, on any port
+      # No `ports:` on purpose: this is the rule that makes a port nobody
+      # predicted show up as rpcbind.
+      tunnel: ""
+      conf: 10
+      probes:
+        - id: dump-v3
+          description: RPCB v3 DUMP (RFC 1833)
+          # The same 44 byte call as rpcbind.yaml, for the reason documented
+          # there: the v3 answer carries the registry as readable strings.
+          send: "\x80\x00\x00\x28\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x01\x86\xa0\x00\x00\x00\x03\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+          read_timeout: 3s
+          read_bytes: 16384
+      matches:
+        - id: rpcb-v3
+          pattern: '(?s)^.{4}(\x00\x00\x00\x01){2}(\x00\x00\x00\x00){4}\x00\x00\x00\x01\x00\x01\x86\xa0\x00\x00\x00[\x02-\x04]\x00\x00\x00[\x03-\x04](?:tcp|udp)'
+          set:
+            service: rpcbind
+            product: ONC RPC portmapper
+            info: RPCB v3, registry readable
+            cpe: cpe:/a:rpcbind_project:rpcbind

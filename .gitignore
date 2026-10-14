@@ -1,0 +1,7 @@
+# Python leftovers from running a template's test harness.
+__pycache__/
+*.pyc
+
+# Scratch space while writing a template.
+/tmp/
+*.log

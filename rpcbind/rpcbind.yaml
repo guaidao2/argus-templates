@@ -1,0 +1,498 @@
+# argus template: ONC RPC portmapper (rpcbind), TCP/UDP port 111.
+#
+# What this plugin is for
+# ----------------------
+# Port 111 is one of the few ports that answers a question you did not have to
+# guess: ask it for its registry and it names every RPC program the host runs,
+# with the version, the transport and the port each one listens on. That answer
+# is the useful part of a port 111 finding -- the services it names are
+# routinely on high, unpredictable ports that no port scan will find.
+#
+# This plugin does two things with that answer:
+#
+#   1. It identifies the port from the RPCB v3 answer rather than the v2 one.
+#      The v3 answer is made of XDR strings (netid, universal address, owner),
+#      so what the report shows for the port -- the banner plus the extra info
+#      -- is readable text instead of binary noise. The universal address even
+#      carries the port: "0.0.0.0.8.1" is 8*256+1 = 2049, the NFS port.
+#   2. It reports each disclosed registration as its own line, so the registry
+#      is rendered into the report instead of staying in a hex dump. The
+#      NFS/NIS family is already covered by the built-in checks; this plugin
+#      adds the legacy SunOS-era daemons that a modern /etc/rpc still names
+#      (rexd, rusersd, rstatd, walld, sprayd, bootparam, keyserv, amq).
+#
+# Design notes
+# ------------
+# * A probe is one write and one read, on its own connection. Both the v2 and
+#   the v3 DUMP call are 40 bytes of XDR (plus a 4 byte record marker on TCP),
+#   and they are written out byte for byte with the wire format spelled out in
+#   the comments.
+# * The registry is an XDR linked list: every entry is preceded by a four byte
+#   "more entries follow" marker, and the list ends with a zero. So an entry's
+#   program number is anchored to the marker that starts its element, and the
+#   marker is allowed to be 0 as well as 1 -- a program that happens to be the
+#   last entry of the list is registered like any other, and a pattern that
+#   insists on "more follow" silently skips it.
+# * Nothing here sends SET or UNSET. Those two procedures change the registry
+#   (an UNSET that succeeds takes a live mapping away), which makes them
+#   attacks rather than checks, and a check must not mutate the target.
+#   CVE-2017-8779 is left out for the same reason: it is reached through
+#   RPCBPROC_CALLIT and the probe itself is the memory exhaustion, so it can
+#   only be assessed from the host's package versions. See README.md.
+# * A rule with no `ports:` is applied to every open port; a rule that names a
+#   port is applied to that port. Everything here passes `service: rpcbind` so
+#   the port keeps the built-in rpcbind checks as well.
+apiVersion: argus.plugin/v1
+name: rpcbind-111
+version: 1.0.0
+author: guaidao2
+license: MIT
+argus_min_version: 0.1.0
+description: |
+  Renders what port 111 discloses: identifies the portmapper from its RPCB v3
+  answer, and reports every registered RPC program, including the legacy
+  daemons the built-in checks do not name.
+
+fingerprints:
+  apiVersion: argus.fingerprint/v1
+  id: rpcbind-111-fingerprints
+  description: Identify the portmapper and render the registry it discloses
+  rules:
+    # ------------------------------------------------------------ identify
+    - id: rpcbind-rpcb-v3
+      description: ONC RPC portmapper answering the RPCB v3 protocol (RFC 1833)
+      # Port-bound rules are tried before rules with no ports, and plugin rules
+      # before built-in ones, so this rule gets the first chance on 111. When a
+      # host does not answer it (an old portmap speaks version 2 only and
+      # answers PROG_MISMATCH), the built-in rpcbind-tcp rule still runs and
+      # identifies the port exactly as before: no host gets worse.
+      ports: [111]
+      tunnel: ""
+      conf: 10
+      probes:
+        - id: dump-v3
+          description: RPCB v3 DUMP, the call behind "rpcinfo -p"
+          # RPC CALL: 40 bytes of XDR after the 4 byte record marker.
+          #   \x80\x00\x00\x28      record marker: last fragment, 40 bytes
+          #   \x00\x00\x00\x01      xid
+          #   \x00\x00\x00\x00      msg_type CALL
+          #   \x00\x00\x00\x02      rpcvers 2 (ONC RPC version, not the RPCB one)
+          #   \x00\x01\x86\xa0      program 100000 (portmapper)
+          #   \x00\x00\x00\x03      version 3 (RPCB, RFC 1833)
+          #   \x00\x00\x00\x04      procedure 4 (DUMP)
+          #   \x00\x00\x00\x00 x2   credential: AUTH_NULL, length 0
+          #   \x00\x00\x00\x00 x2   verifier:   AUTH_NULL, length 0
+          send: "\x80\x00\x00\x28\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x01\x86\xa0\x00\x00\x00\x03\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+          read_timeout: 3s
+          # A registry answer grows with the number of registered programs, and
+          # the entries worth naming are often at the end of the list.
+          read_bytes: 16384
+      matches:
+        - id: rpcb-v3
+          # Reply header, then one registry entry, in this order:
+          #   xxxx                  record marker (length depends on the answer)
+          #   \x00\x00\x00\x01      xid echoed
+          #   \x00\x00\x00\x01      msg_type REPLY
+          #   \x00\x00\x00\x00      reply_stat MSG_ACCEPTED
+          #   \x00\x00\x00\x00 x2   verifier AUTH_NULL, length 0
+          #   \x00\x00\x00\x00      accept_stat SUCCESS -- a PROG_MISMATCH
+          #                         answer stops here, on purpose
+          #   \x00\x00\x00\x01      "more entries follow"
+          #   \x00\x01\x86\xa0      program 100000 (rpcbind registers itself)
+          #   \x00\x00\x00[\x02-\x04]  version 2, 3 or 4. Written as a class
+          #                         because RE2 has no way to put a wildcard
+          #                         digit inside a \x escape: \x0[2-4] is an
+          #                         invalid escape, not a pattern.
+          #   \x00\x00\x00[\x03-\x04]  a netid string 3 or 4 bytes long:
+          #                         "tcp", "udp", "tcp6", "udp6". A v2 (portmap)
+          #                         answer has no strings at all -- it is four
+          #                         byte words end to end -- so this cannot
+          #                         fire on an answer that is not RPCB shaped.
+          pattern: '(?s)^.{4}(\x00\x00\x00\x01){2}(\x00\x00\x00\x00){4}\x00\x00\x00\x01\x00\x01\x86\xa0\x00\x00\x00[\x02-\x04]\x00\x00\x00[\x03-\x04](?:tcp|udp)'
+          set:
+            service: rpcbind
+            product: ONC RPC portmapper
+            info: RPCB v3, registry readable
+            cpe: cpe:/a:rpcbind_project:rpcbind
+
+    # ---------------------------------------------------- identify, over UDP
+    - id: rpcbind-rpcb-v3-udp
+      description: ONC RPC portmapper answering the RPCB v3 protocol over UDP
+      # Same idea on the datagram side, and for the same reason: the v2 answer
+      # is four byte words and renders as dots, the v3 answer carries the netids
+      # and universal addresses as text. Without this rule the built-in v2 rule
+      # wins on UDP and the report shows nothing readable.
+      proto: udp
+      ports: [111]
+      tunnel: ""
+      conf: 10
+      probes:
+        - id: dump-v3-udp
+          description: RPCB v3 DUMP without the record marker UDP does not use
+          send: "\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x01\x86\xa0\x00\x00\x00\x03\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+          read_timeout: 3s
+          read_bytes: 16384
+      matches:
+        - id: rpcb-v3-udp
+          pattern: '(?s)^(\x00\x00\x00\x01){2}(\x00\x00\x00\x00){4}\x00\x00\x00\x01\x00\x01\x86\xa0\x00\x00\x00[\x02-\x04]\x00\x00\x00[\x03-\x04](?:tcp|udp)'
+          set:
+            service: rpcbind
+            product: ONC RPC portmapper
+            info: RPCB v3, registry readable
+            cpe: cpe:/a:rpcbind_project:rpcbind
+
+    # ------------------------------------------------- the registry, over TCP
+    - id: rpcbind-registry
+      description: The portmapper answers an unauthenticated registry DUMP
+      kind: check
+      ports: [111]
+      service: rpcbind
+      probes:
+        - id: dump-v2
+          description: portmap v2 DUMP, the call every portmapper answers
+          # Same call with version 2 (the portmap protocol, RFC 1057), which
+          # even the oldest portmapper answers:
+          #   \x80\x00\x00\x28      record marker: last fragment, 40 bytes
+          #   \x00\x00\x00\x01      xid
+          #   \x00\x00\x00\x00      msg_type CALL
+          #   \x00\x00\x00\x02      rpcvers 2
+          #   \x00\x01\x86\xa0      program 100000 (portmapper)
+          #   \x00\x00\x00\x02      version 2 (portmap)
+          #   \x00\x00\x00\x04      procedure 4 (DUMP)
+          #   \x00\x00\x00\x00 x4   AUTH_NULL credential and verifier, empty
+          send: "\x80\x00\x00\x28\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x01\x86\xa0\x00\x00\x00\x02\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+          read_timeout: 3s
+          read_bytes: 16384
+      matches:
+        - id: unauth-dump
+          # A successful reply whose registry list is not empty:
+          #   xxxx                  record marker
+          #   \x00\x00\x00\x01      xid echoed
+          #   \x00\x00\x00\x01      msg_type REPLY
+          #   \x00\x00\x00\x00      reply_stat MSG_ACCEPTED
+          #   \x00\x00\x00\x00 x2   verifier AUTH_NULL, length 0
+          #   \x00\x00\x00\x00      accept_stat SUCCESS
+          #   \x00\x00\x00\x01      "more entries follow" -- the list has at
+          #                         least one entry, which is the disclosure.
+          #                         What the entries are is each match below.
+          pattern: '(?s)^.{4}(\x00\x00\x00\x01){2}(\x00\x00\x00\x00){4}\x00\x00\x00\x01'
+          set: {service: rpcbind}
+          finding:
+            title:
+              en: "RPC: the portmapper disclosed its registry without credentials"
+              zh: "RPC：portmapper 在无凭据情况下泄露了注册表"
+            severity: low
+            description:
+              en: >-
+                One unauthenticated DUMP call returned every RPC program this
+                host has registered, with its version, transport and port. That
+                list is the pivot for the rest of the host: NFS, mountd, NIS
+                and the lock manager are regularly on high, unpredictable ports
+                that a port scan will not find, and the portmapper names them.
+                It is an exposure rather than a bug -- a portmapper is supposed
+                to answer this -- so the severity is about reachability, not
+                about a flaw: if 111 is reachable from networks that have no
+                business enumerating this host, that is the finding.
+                "rpcinfo -p <host>" prints the same list; read it before
+                scanning anything else.
+              zh: >-
+                一次无凭据的 DUMP 调用返回了该主机注册的全部 RPC 程序，含版本、
+                传输与端口。这份列表是后续渗透的支点：NFS、mountd、NIS 与锁管理器
+                经常监听在扫描器猜不到的高端口上，而 portmapper 会把它们点出来。
+                这是暴露面而非漏洞（portmapper 本就该回答该请求），因此严重级别衡量
+                的是可达性：如果 111 能被无权枚举该主机的网络访问，那就是问题所在。
+                "rpcinfo -p <host>" 打印同一份列表，先读它再扫别的。
+            refs:
+              - "https://www.rfc-editor.org/rfc/rfc1833.html"
+              - "https://www.rfc-editor.org/rfc/rfc1057.html"
+
+        # --------------------------------------------------------- the entries
+        # Every pattern below has the same shape: the four byte element marker
+        # that starts a registry entry, then the program number as its four
+        # byte big endian encoding. The marker may be 0 as well as 1, because
+        # the last entry of an XDR list is preceded by a zero.
+        - id: rexd
+          pattern: '(?s)\x00\x00\x00[\x00-\x01]\x00\x01\x86\xb1'
+          set: {service: rpcbind}
+          finding:
+            title:
+              en: "RPC registry: rexd (program 100017) is registered"
+              zh: "RPC 注册表：rexd（程序号 100017）已注册"
+            severity: medium
+            description:
+              en: >-
+                rexd is the remote execution service behind "on" and "rex". It
+                was dropped from modern distributions because its
+                authentication is thin -- it trusts the calling host's claim
+                about which user is asking -- and it is normally not run at
+                all. Registered means a daemon is listening, so confirm whether
+                this host really intends to execute commands on behalf of
+                clients, and from which networks. /etc/rpc numbers it 100017
+                (alias rex).
+              zh: >-
+                rexd 是 "on"/"rex" 背后的远程执行服务。它的认证很薄——相信调用方
+                主机关于"是谁在请求"的声明——因此现代发行版已将其移除，通常根本不会
+                运行。被注册意味着确实有守护进程在监听：确认该主机是否真的打算代客户端
+                执行命令，以及允许来自哪些网络。/etc/rpc 中编号为 100017（别名 rex）。
+            refs:
+              - "https://man7.org/linux/man-pages/man5/rpc.5.html"
+
+        - id: rusersd
+          pattern: '(?s)\x00\x00\x00[\x00-\x01]\x00\x01\x86\xa2'
+          set: {service: rpcbind}
+          finding:
+            title:
+              en: "RPC registry: rusersd (program 100002) is registered"
+              zh: "RPC 注册表：rusersd（程序号 100002）已注册"
+            severity: low
+            description:
+              en: >-
+                rusersd answers "rusers": it returns the users logged in on
+                this host, with the terminal and login time behind each
+                session. Usernames are the input to every credential attempt
+                that follows, and the list also says when the people who would
+                notice are away. "rusers -l <host>" prints it.
+              zh: >-
+                rusersd 响应 "rusers"：返回该主机当前登录的用户，以及每个会话对应的
+                终端与登录时间。用户名是后续一切凭据尝试的输入，列表还能说明"会发现
+                异常的人"何时不在。"rusers -l <host>" 即可列出。
+            refs:
+              - "https://man7.org/linux/man-pages/man5/rpc.5.html"
+
+        - id: rstatd
+          pattern: '(?s)\x00\x00\x00[\x00-\x01]\x00\x01\x86\xa1'
+          set: {service: rpcbind}
+          finding:
+            title:
+              en: "RPC registry: rstatd (program 100001) is registered"
+              zh: "RPC 注册表：rstatd（程序号 100001）已注册"
+            severity: low
+            description:
+              en: >-
+                rstatd answers "rup" and "perfmeter": uptime, load averages and
+                interface counters. On its own that is a small disclosure --
+                uptime dates the last reboot and therefore the last patch
+                window, and load says when the host is busy enough not to
+                notice. It is also the kind of inetd-era daemon that stays
+                enabled long after anyone stopped needing it.
+              zh: >-
+                rstatd 响应 "rup" 与 "perfmeter"：运行时长、负载均值与网卡计数。
+                单独看这是个小泄露——运行时长能推出上次重启（也就是上次打补丁）的时间，
+                负载能说明主机何时忙到不会注意到异常。它也是那种在 inetd 时代留下、
+                没人再需要却一直开着的守护进程。
+            refs:
+              - "https://man7.org/linux/man-pages/man5/rpc.5.html"
+
+        - id: walld
+          pattern: '(?s)\x00\x00\x00[\x00-\x01]\x00\x01\x86\xa8'
+          set: {service: rpcbind}
+          finding:
+            title:
+              en: "RPC registry: walld (program 100008) is registered"
+              zh: "RPC 注册表：walld（程序号 100008）已注册"
+            severity: info
+            description:
+              en: >-
+                walld answers "rwall" and "shutdown": it writes a message to
+                every terminal on the host. Its value to an attacker is a
+                convincing console message ("the system is going down, run this
+                first"), so it is the social-engineering half of a privileged
+                session rather than a data leak. The shutdown alias in /etc/rpc
+                is what usually keeps it enabled.
+              zh: >-
+                walld 响应 "rwall" 与 "shutdown"：把一条消息写到该主机的每个终端。
+                对攻击者而言它的价值在于能伪造可信的控制台消息（"系统要重启了，先执行
+                这个"），属于针对特权会话的社会工程手段，而不是数据泄露。它在 /etc/rpc
+                里的 shutdown 别名通常是它被长期开着的原因。
+            refs:
+              - "https://man7.org/linux/man-pages/man5/rpc.5.html"
+
+        - id: sprayd
+          pattern: '(?s)\x00\x00\x00[\x00-\x01]\x00\x01\x86\xac'
+          set: {service: rpcbind}
+          finding:
+            title:
+              en: "RPC registry: sprayd (program 100012) is registered"
+              zh: "RPC 注册表：sprayd（程序号 100012）已注册"
+            severity: low
+            description:
+              en: >-
+                sprayd is the server half of "spray": a client hands it a host
+                and a packet count, and the server floods that host. In other
+                words the service is a traffic generator that anyone who can
+                reach it may point at someone else. Treat it as a
+                denial-of-service source rather than an information leak, and
+                check whether it is reachable from outside the administration
+                segment.
+              zh: >-
+                sprayd 是 "spray" 的服务端：客户端给出目标主机与包数量，服务端就向
+                该主机打流量。也就是说这是一个谁都能借去指向第三方的流量生成器。
+                把它当作拒绝服务来源而不是信息泄露来看，并确认它是否能被管理网段之外的
+                地址访问。
+            refs:
+              - "https://man7.org/linux/man-pages/man5/rpc.5.html"
+
+        - id: bootparam
+          pattern: '(?s)\x00\x00\x00[\x00-\x01]\x00\x01\x86\xba'
+          set: {service: rpcbind}
+          finding:
+            title:
+              en: "RPC registry: bootparam (program 100026) is registered"
+              zh: "RPC 注册表：bootparam（程序号 100026）已注册"
+            severity: low
+            description:
+              en: >-
+                bootparamd serves the parameters netboot and diskless clients
+                ask for by name: root path, swap, and which host serves them.
+                The names it accepts are hostnames, and hostnames are not
+                secrets, so the answers are readable too. What they map out is
+                how the fleet is provisioned and where its root filesystems
+                live -- the reconnaissance step before touching NFS exports or
+                the tftp server that carries the kernels.
+              zh: >-
+                bootparamd 向按名字索取的网络引导/无盘客户端提供参数：root 路径、
+                swap、以及由哪台主机提供服务。它接受的名字就是主机名，而主机名不是秘密，
+                因此这些答案同样可读。它们勾出的是整个集群如何被供给、根文件系统放在
+                哪里——这是接触 NFS 导出或承载内核的 tftp 服务之前的情报步骤。
+            refs:
+              - "https://man7.org/linux/man-pages/man5/rpc.5.html"
+
+        - id: keyserv
+          pattern: '(?s)\x00\x00\x00[\x00-\x01]\x00\x01\x86\xbd'
+          set: {service: rpcbind}
+          finding:
+            title:
+              en: "RPC registry: keyserv (program 100029) is registered"
+              zh: "RPC 注册表：keyserv（程序号 100029）已注册"
+            severity: low
+            description:
+              en: >-
+                keyserv holds the per-user keys that secure RPC uses, and it is
+                the piece of NIS+/secure RPC with the most to lose: nothing
+                about a key server requires it to be reachable from other
+                hosts. If secure RPC is no longer in use here, the daemon is
+                leftover code from when it was, and the question worth asking
+                is why it is still running.
+              zh: >-
+                keyserv 保存 secure RPC 使用的每用户密钥，是 NIS+/secure RPC 中
+                最"输不起"的一环：密钥服务本没有任何理由需要被其他主机访问。如果这里
+                已不再使用 secure RPC，那它就是那个时代的遗留代码，值得问的是它为什么
+                还在运行。
+            refs:
+              - "https://man7.org/linux/man-pages/man5/rpc.5.html"
+
+        - id: amd-amq
+          pattern: '(?s)\x00\x00\x00[\x00-\x01]\x00\x04\x93\xf3'
+          set: {service: rpcbind}
+          finding:
+            title:
+              en: "RPC registry: the amd control interface (program 300019) is registered"
+              zh: "RPC 注册表：amd 控制接口（程序号 300019）已注册"
+            severity: low
+            description:
+              en: >-
+                Program 300019 is amd, the automounter, and this is the
+                interface amq drives. "amq <host>" lists the mounts amd
+                manages and the map each one came from -- read-only and safe,
+                and a good picture of which filesystems are mounted on demand,
+                from where. The same interface carries control requests: treat
+                those as intrusive and clear them with the owner first, because
+                unmounting a live automount is an outage.
+              zh: >-
+                程序号 300019 是自动挂载器 amd，这正是 amq 驱动的接口。
+                "amq <host>" 会列出 amd 管理的挂载点及其来源 map——只读、安全，
+                能清楚看出哪些文件系统是按需从何处挂载的。同一接口也承载控制请求：
+                那类操作应按侵入性操作对待，并先取得系统所有者同意，因为卸载一个正在
+                使用的自动挂载点就是一次故障。
+            refs:
+              - "https://man7.org/linux/man-pages/man5/rpc.5.html"
+
+    # ------------------------------------------------- the registry, over UDP
+    - id: rpcbind-udp-registry
+      description: The portmapper answers a registry DUMP over UDP
+      kind: check
+      proto: udp
+      ports: [111]
+      service: rpcbind
+      probes:
+        - id: dump-v2-udp
+          description: The same v2 DUMP call with no record marker, as UDP requires
+          # UDP has no record marking, so the call is the 40 bytes of XDR on
+          # their own. Same fields, same order, as the TCP probe above.
+          send: "\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x01\x86\xa0\x00\x00\x00\x02\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+          read_timeout: 3s
+          read_bytes: 16384
+      matches:
+        - id: udp-amplification
+          # The reply starts at the xid: no record marker on a datagram. A
+          # datagram that is not a decodable call gets no answer at all, so an
+          # answer here means this really is a portmapper answering DUMP over
+          # UDP, not an unrelated service echoing bytes back.
+          pattern: '(?s)^(\x00\x00\x00\x01){2}(\x00\x00\x00\x00){4}\x00\x00\x00\x01'
+          set: {service: rpcbind}
+          finding:
+            title:
+              en: "RPC: the portmapper answers DUMP over UDP (reflection/amplification)"
+              zh: "RPC：portmapper 在 UDP 上应答 DUMP（反射放大）"
+            severity: medium
+            description:
+              en: >-
+                The same unauthenticated call was answered over UDP. UDP source
+                addresses are not authenticated, so anyone who can reach this
+                port can send the query with a forged source address and have
+                the answer delivered to a third party. US-CERT lists portmap
+                among the UDP amplification protocols with a bandwidth
+                amplification factor of 7 to 28, and a measurement of real
+                deployments puts a 68 byte query at 486 to 1930 bytes back
+                (average around 18x). The response grows with the number of
+                registered programs, so this finding and the size of the
+                registry above go together. Firewalling 111/udp from untrusted
+                networks -- or binding rpcbind to internal addresses -- removes
+                the vector while leaving 111/tcp usable.
+              zh: >-
+                同一次无凭据调用在 UDP 上同样得到了应答。UDP 源地址不经认证，因此
+                任何能访问该端口的人都可以伪造源地址发出查询，让应答落到第三方主机上。
+                US-CERT 把 portmap 列为 UDP 放大协议之一，带宽放大倍数为 7 至 28；
+                对真实部署的测量显示 68 字节查询可换回 486 至 1930 字节（平均约 18 倍）。
+                应答大小随注册程序数量增长，因此这条结论与上面注册表的规模是同一件事。
+                在不可信网络边界封堵 111/udp（或让 rpcbind 只绑定内网地址）即可消除该
+                向量，同时保留 111/tcp 的可用性。
+            refs:
+              - "https://www.cisa.gov/news-events/alerts/2014/01/17/udp-based-amplification-attacks"
+              - "https://seclists.org/cert/2017/236"
+
+hack_reasons:
+  apiVersion: argus.hackreason/v1
+  id: rpcbind-111-notes
+  description: What the port 111 registry is worth, and what it cannot tell you
+  entries:
+    - id: rpcbind-111
+      ports: [111]
+      service: rpcbind
+      # rpcbind is regularly moved off 111, in containers and behind NAT, so the
+      # note follows the service as well as the port.
+      any_port: true
+      title:
+        en: "ONC RPC portmapper (rpcbind)"
+        zh: "ONC RPC 端口映射服务（rpcbind）"
+      points:
+        en:
+          - "Ask it for the registry on both transports: rpcinfo -p <host> for the v2 list, rpcinfo -T udp <host> for the UDP side, since the two register different ports"
+          - "Read universal addresses as ports: the last two numbers are the port in base 256, so 0.0.0.0.8.1 is 2049 (NFS)"
+          - "Follow the entries the built-in checks skip: rexd (100017) is a remote execution service, rusersd (100002) lists logged-in users, rstatd (100001), bootparam (100026) and amq (300019) each leak a different part of the provisioning picture"
+          - "If 111/udp is reachable from an untrusted network it is also a reflection/amplification source (US-CERT: bandwidth amplification factor 7 to 28); TCP-only exposure removes the vector"
+          - "rpcbind through 0.2.4 and libtirpc through 1.0.1 are affected by CVE-2017-8779, a memory exhaustion reached through RPCBPROC_CALLIT. The protocol never reports a version, so read the package version on the host rather than probing for it: the probe is the denial of service"
+          - "SET and UNSET change the registry and are restricted to the loopback transport. Do not attempt them from a scanner -- a successful UNSET removes a live mapping"
+        zh:
+          - "两种传输都要问一遍：rpcinfo -p <host> 取 v2 列表，rpcinfo -T udp <host> 看 UDP 侧，两侧注册的端口并不相同"
+          - "把 universal address 读成端口：最后两个数字是 256 进制的端口，所以 0.0.0.0.8.1 就是 2049（NFS）"
+          - "跟进内置检测跳过的条目：rexd（100017）是远程执行服务，rusersd（100002）会列出当前登录用户，rstatd（100001）、bootparam（100026）与 amq（300019）各自泄露供给体系的一部分"
+          - "如果 111/udp 在不可信网络可达，它同时是反射放大源（US-CERT 给出的带宽放大倍数为 7 至 28）；只暴露 TCP 即可消除该向量"
+          - "rpcbind 0.2.4 及以下、libtirpc 1.0.1 及以下受 CVE-2017-8779 影响（经 RPCBPROC_CALLIT 触发内存耗尽）。协议本身不报版本，请在主机上读软件包版本，不要用扫描器去探：那一次探测就是拒绝服务本身"
+          - "SET 与 UNSET 会改动注册表，且仅允许来自回环传输。不要用扫描器尝试——一次成功的 UNSET 会摘掉一个正在使用的映射"
+      tools: [rpcinfo, showmount, ypcat, rusers, amq]
+      refs:
+        - "https://www.rfc-editor.org/rfc/rfc1833.html"
+        - "https://www.cisa.gov/news-events/alerts/2014/01/17/udp-based-amplification-attacks"
+        - "https://security-tracker.debian.org/tracker/CVE-2017-8779"
+        - "https://man7.org/linux/man-pages/man5/rpc.5.html"
